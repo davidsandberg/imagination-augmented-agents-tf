@@ -5,3 +5,5 @@ __pycache__
 env_logs
 a2c_logs
 i2a_logs
+/bouncing_balls_testing_data.mat
+/bouncing_balls_training_data.mat
