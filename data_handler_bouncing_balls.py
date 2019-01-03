@@ -4,10 +4,12 @@ This script comes from the RTRBM code by Ilya Sutskever from
 http://www.cs.utoronto.ca/~ilya/code/2008/RTRBM.tar
 """
 
-from numpy import *                
+#from numpy import *                
+import numpy as np
 from scipy import *               
 import pdb
 #import cPickle as pickle
+import pickle
 import scipy.io
 
 import matplotlib
@@ -28,7 +30,7 @@ def size(A):
     else:
         return A.size()
 
-det = linalg.det
+det = np.linalg.det
 
 def new_speeds(m1, m2, v1, v2):
     new_v2 = (2*m1*v1 + v2*(m2-m1))/(m1+m2)
@@ -131,6 +133,10 @@ def bounce_vec(res, n=2, T=128, r =None, m =None):
     V = matricize(x,res,r)
     return V.reshape(T, res**2)  
 
+def save_as_pickle(filename, arr):
+    with open(filename, 'wb') as f:
+        pickle.dump(arr, f)
+
 # make sure you have this folder
 logdir = './sample'
 def show_sample(V):
@@ -143,25 +149,20 @@ def show_sample(V):
         plt.savefig(fname)      
         
 if __name__ == "__main__":
-    res=30
-    T=100
-    N=4000
+    res=80
+    T=20
+    N=5000
+    nrof_balls = 1
     dat=empty((N), dtype=object)
     for i in range(N):
-        dat[i]=bounce_vec(res=res, n=3, T=100)
-    data={}
-    data['Data']=dat
-    scipy.io.savemat('bouncing_balls_training_data.mat',data)
+        dat[i]=bounce_vec(res=res, n=nrof_balls, T=T)
+    data = np.reshape(stack(dat), (N, T, res, res))
+    save_as_pickle('bouncing_balls_training_data.pkl', data)
     
-    N=200
+    N=1000
     dat=empty((N), dtype=object)
     for i in range(N):
-        dat[i]=bounce_vec(res=res, n=3, T=100)
-    data={}
-    data['Data']=dat
-    scipy.io.savemat('bouncing_balls_testing_data.mat',data)    
-    
-    # show one video
-    # show_sample(dat[1])
-    # ffmpeg -start_number 0 -i %d.png -c:v libx264 -pix_fmt yuv420p -r 30 sample.mp4
+        dat[i]=bounce_vec(res=res, n=nrof_balls, T=T)
+    data = np.reshape(stack(dat), (N, T, res, res))
+    save_as_pickle('bouncing_balls_testing_data.pkl', data)
 
