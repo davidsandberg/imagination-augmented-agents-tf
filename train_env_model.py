@@ -84,17 +84,24 @@ def posterior_module(mu, sigma, s, e, a):
         sigma_hat = tf.nn.softplus(conv_stack(c, 1, 32, 3, 32, 3, 64))
     return mu_hat, sigma_hat
 
-def initial_state_module(ex):
-    """
+def initial_state_module(ex, nrof_observations=3):
+    """Computes the initial state from the feature maps of a
+    number of consequtive initial observations. 
+    These feature maps are given in the batch dimension, meaning
+    that the first dimension should be of size batch_size x nrof_observations.
     """
     with tf.variable_scope('initial_state_module'):
-        e = tf.split(ex, num_or_size_splits=3, axis=0)
+        shape = [-1,nrof_observations]+ex.get_shape().as_list()[1:]
+        e = tf.unstack(tf.reshape(ex, shape), axis=1)
         c = tf.concat(e, axis=-1)
         s = conv_stack(c, 1, 64, 3, 64, 3, 64)
     return s
 
-def observation_decoder(s):
-    c = tf.concat([s], axis=-1)
+def observation_decoder(s, z):
+    if z is None:
+        c = s
+    else:
+        c = tf.concat([s, z], axis=-1)
     cs1 = conv_stack(c, 1, 32, 5, 32, 3, 64)
     dts1 = tf.nn.depth_to_space(cs1, 2)
     cs2 = conv_stack(dts1, 3, 64, 3, 64, 1, 48)
@@ -115,26 +122,29 @@ def kl_divergence_gaussians(mu0, log_sigma0, mu1, log_sigma1):
     Dkl = 0.5 * (tf1 + tf2 - k + tf3)
     return Dkl
 
-def cross_entropy(p, q):
-    return 0.0
+def cross_entropy(labels, logits):
+    xent = -tf.reduce_sum(labels * tf.log(logits), [0, 1, 2, 3])
+    return xent
 
 class EnvModel():
     
     def __init__(self, obs_shape, num_actions):
         width, height, depth = obs_shape
     
-        self.obs_init = tf.placeholder(tf.float32, [3, width, height, depth])  # TODO: Fix dimensions with batches
+        self.obs_init = tf.placeholder(tf.float32, [None, width, height, depth])  # TODO: Fix dimensions with batches
         self.obs = tf.placeholder(tf.float32, [None, width, height, depth])
         self.actions = tf.placeholder(tf.int32, [None,])
         
-        with tf.variable_scope('observation_encoder'):
-            encoded_init_obs = observation_encoder(self.obs_init)
-        
+        assert_op = tf.Assert(tf.equal(tf.shape(self.obs_init)[0], tf.shape(self.obs)[0]*3), [self.obs_init, self.obs])
+        with tf.control_dependencies([assert_op]):
+            # Make sure that parameters for the observation encoder are shared
+            with tf.variable_scope('observation_encoder', reuse=False):
+                encoded_obs = observation_encoder(self.obs)
+            with tf.variable_scope('observation_encoder', reuse=True):
+                encoded_init_obs = observation_encoder(self.obs_init)
+            
+        # Initialize state
         self.state = initial_state_module(encoded_init_obs)
-        
-        # Make sure that parameters for the observation encoder are shared
-        with tf.variable_scope('observation_encoder', reuse=True):
-            encoded_obs = observation_encoder(self.obs)
         
         # Convert actions to one-hot
         qq = tf.one_hot(tf.reshape(self.actions, [-1, 1, 1]), num_actions, axis=-1)
@@ -145,14 +155,14 @@ class EnvModel():
         mu_hat, sigma_hat = posterior_module(mu, sigma, self.state, encoded_obs, onehot_actions)
         
         # Sample from z using the reparametrization trick
-        eps = tf.random_normal(sigma_hat.get_shape(), 0.0, 1.0, dtype=tf.float32)
+        eps = tf.random_normal(tf.shape(sigma_hat), 0.0, 1.0, dtype=tf.float32)
         z = mu_hat + tf.multiply(tf.exp(sigma_hat), eps)  # Check how standard deviation is represented in the paper
         
         self.next_state = state_transition_module(onehot_actions, self.state, z)
-        self.obs_hat = observation_decoder(self.next_state)
+        self.obs_hat = observation_decoder(self.next_state, z)
         
         self.regularization_loss = kl_divergence_gaussians(mu, sigma, mu_hat, sigma_hat)
-        self.reconstruction_loss = cross_entropy(self.obs, self.obs_hat)
+        self.reconstruction_loss = cross_entropy(self.obs, self.obs_hat)  # Should be KL divergence according to paper
         self.loss = self.regularization_loss + self.reconstruction_loss
         
         self.train_op = tf.train.AdamOptimizer().minimize(self.loss)
@@ -166,18 +176,21 @@ if __name__ == '__main__':
 
     with tf.Session() as sess:
         with tf.variable_scope('env_model'):
-            env_model = EnvModel((80, 80, 1), 1)
+            env_model = EnvModel((80, 80, 3), 1)
 
         sess.run(tf.global_variables_initializer())
 
         train = load_pickle('bouncing_balls_testing_data.pkl')
         train = np.expand_dims(train, 4)
-        obs_init = train[0,:3,:,:,:]
-        obs = np.expand_dims(train[0,3,:,:,:], 0)
-        actions = np.zeros((1,), dtype=np.float32)
+        train = np.repeat(train, 3, axis=4)
+        #print(train.shape)
+        obs_init = train[0:5,:3,:,:,:].reshape(15,80,80,3)
+        obs = train[0:5,3,:,:,:]
+        actions = np.zeros((5,), dtype=np.float32)
         
         feed_dict = {env_model.obs_init:obs_init, env_model.obs:obs, env_model.actions:actions}
-        sess.run([env_model.train_op], feed_dict=feed_dict)
+        _, obs_hat_, next_state_ = sess.run([env_model.train_op, env_model.obs_hat, env_model.next_state], feed_dict=feed_dict)
         
-        
+        print('Next state shape: ', next_state_.shape)
+        print('Generated observation shape: ', obs_hat_.shape)
         
