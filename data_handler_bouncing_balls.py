@@ -5,6 +5,7 @@ http://www.cs.utoronto.ca/~ilya/code/2008/RTRBM.tar
 """
 
 #from numpy import *                
+import sys
 import numpy as np
 from scipy import *               
 import pdb
@@ -151,18 +152,22 @@ def show_sample(V):
 if __name__ == "__main__":
     res=80
     T=20
-    N=5000
+    N=1000
     nrof_balls = 1
-    dat=empty((N), dtype=object)
-    for i in range(N):
-        dat[i]=bounce_vec(res=res, n=nrof_balls, T=T)
-    data = np.reshape(stack(dat), (N, T, res, res))
-    save_as_pickle('bouncing_balls_training_data.pkl', data)
+    for j in range(20):
+        print('.', end='')
+        sys.stdout.flush()
+        dat=empty((N), dtype=object)
+        for i in range(N):
+            dat[i]=bounce_vec(res=res, n=nrof_balls, T=T)
+        data = np.reshape(stack(dat), (N, T, res, res))
+        save_as_pickle('data/bouncing_balls_training_data_%03d.pkl' % j, data)
+    print('\nDone')
     
     N=1000
     dat=empty((N), dtype=object)
     for i in range(N):
         dat[i]=bounce_vec(res=res, n=nrof_balls, T=T)
     data = np.reshape(stack(dat), (N, T, res, res))
-    save_as_pickle('bouncing_balls_testing_data.pkl', data)
+    save_as_pickle('data/bouncing_balls_testing_data.pkl', data)
 

@@ -3,7 +3,7 @@ import numpy as np
 import pickle
 import matplotlib.pyplot as plt
 
-def conv_stack(X, k1, c1, k2, c2, k3, c3, initializer=tf.initializers.truncated_normal(0.00000001)):
+def conv_stack(X, k1, c1, k2, c2, k3, c3):
     """Implements the conv_stack module as described in figure 6 in the paper
     """
     conv1 = tf.contrib.layers.conv2d(X, num_outputs=c1, kernel_size=k1,
@@ -193,20 +193,22 @@ class EnvModel():
         for t in range(nrof_time_steps):
           
             if t > 0:
+                # Variables are reused for time step 1 and onwards
                 tf.get_variable_scope().reuse_variables()
           
-            # Compute statistics for prior and posterior
+            # Compute prior statistics
             mu, sigma = prior_module(state, onehot_actions[:,t,:,:,:])
-            mu_hat, sigma_hat = posterior_module(mu, sigma, state, self.encoded_obs[:,t,:,:,:], onehot_actions[:,t,:,:,:])
             mu_list += [ mu ]
             sigma_list += [ sigma ]
+            
+            # Compute posterior statistics
+            mu_hat, sigma_hat = posterior_module(mu, sigma, state, self.encoded_obs[:,t,:,:,:], onehot_actions[:,t,:,:,:])
             mu_hat_list += [ mu_hat ]
             sigma_hat_list += [ sigma_hat ]
             
             # Sample from z using the reparametrization trick
             eps = tf.random_normal(tf.shape(sigma_hat), 0.0, 1.0, dtype=tf.float32)
-            #z = mu_hat + tf.multiply(tf.exp(sigma_hat), eps)  # Check how standard deviation is represented in the paper
-            z = mu_hat + tf.multiply(sigma_hat, eps)  # Check how standard deviation is represented in the paper
+            z = mu_hat + tf.multiply(sigma_hat, eps)
             z_list += [ z ]
             
             # Calculate next state
@@ -220,15 +222,16 @@ class EnvModel():
             
             state = next_state
             
-        self.next_state = tf.stack(next_state_list, axis=1)
-        self.obs_hat = tf.stack(obs_hat_list, axis=1)
-        
-        # Calculate loss
+        # Stack lists of tensors
         self.mu = tf.stack(mu_list, axis=1)
         self.sigma = tf.stack(sigma_list, axis=1)
         self.mu_hat = tf.stack(mu_hat_list, axis=1)
         self.sigma_hat = tf.stack(sigma_hat_list, axis=1)
         self.z = tf.stack(z_list, axis=1)
+        self.next_state = tf.stack(next_state_list, axis=1)
+        self.obs_hat = tf.stack(obs_hat_list, axis=1)
+
+        # Calculate loss
         self.regularization_loss, self.zz = kl_divergence_gaussians(self.mu, self.sigma, self.mu_hat, self.sigma_hat)
         self.reconstruction_loss = cross_entropy(self.obs[:,nrof_init_time_steps:,:,:,:], self.obs_hat)  # Should be KL divergence according to paper
         
@@ -243,7 +246,6 @@ if __name__ == '__main__':
     with tf.Session() as sess:
         with tf.variable_scope('env_model'):
             env_model = EnvModel((13, 80, 80, 3), 1, 10)
-            #env_model = EnvModel((13, 80, 80, 3), 1, 10)
 
         reg_loss = tf.reduce_sum(env_model.regularization_loss)
         rec_loss = tf.reduce_sum(env_model.reconstruction_loss)
@@ -266,8 +268,7 @@ if __name__ == '__main__':
           [m.obs_hat, m.initial_state, m.next_state, m.regularization_loss, m.reconstruction_loss, m.encoded_obs_init, m.mu, m.sigma, m.mu_hat, m.sigma_hat, m.zz, m.encoded_obs, m.z], feed_dict=feed_dict)
         
         print('obs:              (%s), (%s), (%s)' % format_mmm(obs))
-        print('encoded obs: (%s), (%s), (%s)' % format_mmm(encoded_obs_))
-        #print('initial_state:    (%s), (%s), (%s)' % format_mmm(initial_state_))
+        print('encoded obs:      (%s), (%s), (%s)' % format_mmm(encoded_obs_))
         print('mu:               (%s), (%s), (%s)' % format_mmm(mu_))
         print('sigma:            (%s), (%s), (%s)' % format_mmm(sigma_))
         print('mu_hat:           (%s), (%s), (%s)' % format_mmm(mu_hat_))
