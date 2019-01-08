@@ -2,6 +2,9 @@ import tensorflow as tf
 import numpy as np
 import pickle
 import matplotlib.pyplot as plt
+import os
+from tensorflow.python.data import Dataset
+
 
 def conv_stack(X, k1, c1, k2, c2, k3, c3):
     """Implements the conv_stack module as described in figure 6 in the paper
@@ -151,6 +154,13 @@ def cross_entropy(labels, logits):
     xent = -tf.reduce_sum(labels * logits, axis=[2,3,4])
     return xent
   
+def get_onehot_actions(actions, nrof_actions, state_shape):
+    length = actions.get_shape()[1]
+    _, height, width, _ = state_shape
+    qq = tf.one_hot(tf.reshape(actions, [-1, length, 1, 1]), nrof_actions, axis=-1)
+    onehot_actions = tf.tile(qq, multiples=(1, 1, height, width, 1))
+    return onehot_actions
+
 def format_mmm(x):
     min_str, max_str, mean_str = [], [], []
     for i in range(x.shape[1]):
@@ -161,7 +171,7 @@ def format_mmm(x):
   
 class EnvModel():
     
-    def __init__(self, obs_shape, num_actions, nrof_time_steps):
+    def __init__(self, obs_shape, nrof_actions=None, nrof_time_steps=None):
         length, width, height, depth = obs_shape
         nrof_init_time_steps = 3
     
@@ -181,8 +191,8 @@ class EnvModel():
         state = self.initial_state
         
         # Convert actions to one-hot
-        qq = tf.one_hot(tf.reshape(self.actions, [-1, length, 1, 1]), num_actions, axis=-1)
-        onehot_actions = tf.tile(qq, multiples=(1, 1, state.get_shape()[1], state.get_shape()[2], 1))
+        onehot_actions = get_onehot_actions(self.actions, nrof_actions, state.get_shape().as_list())
+
         obs_hat_list = []
         next_state_list = []
         mu_list = []
@@ -235,6 +245,18 @@ class EnvModel():
         self.regularization_loss, self.zz = kl_divergence_gaussians(self.mu, self.sigma, self.mu_hat, self.sigma_hat)
         self.reconstruction_loss = cross_entropy(self.obs[:,nrof_init_time_steps:,:,:,:], self.obs_hat)  # Should be KL divergence according to paper
         
+def create_dataset(filelist, path, nrof_epochs=1, buffer_size=25, batch_size=10):
+    def gen(filelist, path):
+        for fn in filelist:
+            data = np.float32(load_pickle(os.path.join(path, fn)))
+            for i in range(data.shape[0]):
+                yield data[i,:13,:,:,:]
+          
+    ds = Dataset.from_generator(lambda: gen(filelist, path), tf.float32, tf.TensorShape([13, 80, 80, 3]))
+    ds = ds.repeat(nrof_epochs)
+    ds = ds.prefetch(buffer_size)
+    ds = ds.batch(batch_size)
+    return ds    
     
 def load_pickle(filename):
     with open(filename, 'rb') as f:
@@ -244,17 +266,21 @@ def load_pickle(filename):
 if __name__ == '__main__':
 
     with tf.Session() as sess:
+      
+        filelist = [ 'bouncing_balls_training_data_%03d.pkl' % i for i in range(20) ]
+        ds = create_dataset(filelist, 'data', nrof_epochs=1, buffer_size=25, batch_size=10)
+      
         with tf.variable_scope('env_model'):
             env_model = EnvModel((13, 80, 80, 3), 1, 10)
 
         reg_loss = tf.reduce_sum(env_model.regularization_loss)
         rec_loss = tf.reduce_sum(env_model.reconstruction_loss)
         loss = reg_loss + rec_loss
-        env_model.train_op = tf.train.AdamOptimizer().minimize(loss)
+        train_op = tf.train.AdamOptimizer().minimize(loss)
 
         sess.run(tf.global_variables_initializer())
 
-        train = load_pickle('bouncing_balls_testing_data.pkl')
+        train = load_pickle('data/bouncing_balls_testing_data.pkl')
         train = np.expand_dims(train, 4)
         train = np.repeat(train, 3, axis=4)
         obs = train[0:10,:13,:,:,:]
@@ -263,21 +289,24 @@ if __name__ == '__main__':
         
         print('Training')
         feed_dict = {env_model.obs:obs, env_model.actions:actions}
-        #_, obs_hat_, next_state_, rec_loss_, reg_loss_, loss_ = sess.run([env_model.train_op, env_model.obs_hat, env_model.next_state, rec_loss, reg_loss, loss], feed_dict=feed_dict)
-        obs_hat_, initial_state_, next_state_, reg_loss_, rec_loss_, eoi_, mu_, sigma_, mu_hat_, sigma_hat_, zz_, encoded_obs_, z_ = sess.run(
-          [m.obs_hat, m.initial_state, m.next_state, m.regularization_loss, m.reconstruction_loss, m.encoded_obs_init, m.mu, m.sigma, m.mu_hat, m.sigma_hat, m.zz, m.encoded_obs, m.z], feed_dict=feed_dict)
-        
-        print('obs:              (%s), (%s), (%s)' % format_mmm(obs))
-        print('encoded obs:      (%s), (%s), (%s)' % format_mmm(encoded_obs_))
-        print('mu:               (%s), (%s), (%s)' % format_mmm(mu_))
-        print('sigma:            (%s), (%s), (%s)' % format_mmm(sigma_))
-        print('mu_hat:           (%s), (%s), (%s)' % format_mmm(mu_hat_))
-        print('sigma_hat:        (%s), (%s), (%s)' % format_mmm(sigma_hat_))
-        print('z:                (%s), (%s), (%s)' % format_mmm(z_))
-        print('next_state:       (%s), (%s), (%s)' % format_mmm(next_state_))
-        print('obs_hat:          (%s), (%s), (%s)' % format_mmm(obs_hat_))
-        
-        print('Reconstruction loss: ', rec_loss_[0,:])
-        print('Regularization loss: ', reg_loss_[0,:])
+        for batch in range(20):
+            #_, obs_hat_, next_state_, rec_loss_, reg_loss_, loss_ = sess.run([train_op, env_model.obs_hat, env_model.next_state, rec_loss, reg_loss, loss], feed_dict=feed_dict)
+            obs_hat_, initial_state_, next_state_, reg_loss_, rec_loss_, eoi_, mu_, sigma_, mu_hat_, sigma_hat_, zz_, encoded_obs_, z_, _ = sess.run(
+              [m.obs_hat, m.initial_state, m.next_state, m.regularization_loss, m.reconstruction_loss, m.encoded_obs_init, m.mu, m.sigma, m.mu_hat, m.sigma_hat, m.zz, m.encoded_obs, m.z, train_op], feed_dict=feed_dict)
+            
+            print('obs:              (%s), (%s), (%s)' % format_mmm(obs))
+            print('encoded obs:      (%s), (%s), (%s)' % format_mmm(encoded_obs_))
+            print('mu:               (%s), (%s), (%s)' % format_mmm(mu_))
+            print('sigma:            (%s), (%s), (%s)' % format_mmm(sigma_))
+            print('mu_hat:           (%s), (%s), (%s)' % format_mmm(mu_hat_))
+            print('sigma_hat:        (%s), (%s), (%s)' % format_mmm(sigma_hat_))
+            print('z:                (%s), (%s), (%s)' % format_mmm(z_))
+            print('next_state:       (%s), (%s), (%s)' % format_mmm(next_state_))
+            print('obs_hat:          (%s), (%s), (%s)' % format_mmm(obs_hat_))
+            
+            print('Reconstruction loss: ', rec_loss_[0,:])
+            print('Regularization loss: ', reg_loss_[0,:])
+            
+            print('\n\n\n')
         #print('Total loss: ', loss_)
         
