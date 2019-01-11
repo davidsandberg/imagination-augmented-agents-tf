@@ -1,8 +1,8 @@
 import tensorflow as tf
 import numpy as np
 import pickle
-import matplotlib.pyplot as plt
 import os
+import time
 from tensorflow.python.data import Dataset
 
 
@@ -127,11 +127,15 @@ def observation_decoder(s, z):
 #     Dkl = 0.5 * (tf1 + tf2 - k + tf3)
 #     return Dkl
   
-# def kl_divergence_gaussians(p_mu, p_sigma_log, q_mu, q_sigma_log):
-#     zz = tf.distributions.kl_divergence(
-#     tf.distributions.Normal(loc=q_mu, scale=tf.exp(q_sigma_log)+1e-4),
-#     tf.distributions.Normal(loc=p_mu, scale=tf.exp(p_sigma_log)+1e-4))
-#     return tf.reduce_sum(zz, axis=[2,3,4]), zz
+def kl_div_gauss(action_dist1, action_dist2, action_size):
+    # https://github.com/openai/baselines/blob/f2729693253c0ef4d4086231d36e0a4307ec1cb3/baselines/acktr/utils.py
+    mean1, std1 = action_dist1[:, :action_size], action_dist1[:, action_size:]
+    mean2, std2 = action_dist2[:, :action_size], action_dist2[:, action_size:]
+
+    numerator = tf.square(mean1 - mean2) + tf.square(std1) - tf.square(std2)
+    denominator = 2 * tf.square(std2) + 1e-8
+    return tf.reduce_sum(
+        numerator/denominator + tf.log(std2) - tf.log(std1),reduction_indices=-1)
   
 def kl_divergence_gaussians(p_mu, p_sigma, q_mu, q_sigma):
     eps = 1e-1
@@ -149,10 +153,10 @@ def kl_divergence_gaussians2(p_mu, p_sigma_log, q_mu, q_sigma_log):
     zz = p_sigma_log - q_sigma_log - .5 * (1. - (q_sigma**2 + r**2) / (p_sigma**2+eps))
     return tf.reduce_sum(zz, axis=[2,3,4]), zz
 
-def cross_entropy(labels, logits):
-    #xent = -tf.reduce_sum(labels * tf.log(logits), axis=[2,3,4])
-    xent = -tf.reduce_sum(labels * logits, axis=[2,3,4])
-    return xent
+def kl_div(p, q):
+    eps = 1e-6
+    kl = tf.reduce_sum(p * (tf.log(p+eps) - tf.log(q+eps)), axis=[2,3,4])
+    return kl
   
 def get_onehot_actions(actions, nrof_actions, state_shape):
     length = actions.get_shape()[1]
@@ -160,23 +164,20 @@ def get_onehot_actions(actions, nrof_actions, state_shape):
     qq = tf.one_hot(tf.reshape(actions, [-1, length, 1, 1]), nrof_actions, axis=-1)
     onehot_actions = tf.tile(qq, multiples=(1, 1, height, width, 1))
     return onehot_actions
-
-def format_mmm(x):
-    min_str, max_str, mean_str = [], [], []
-    for i in range(x.shape[1]):
-        min_str += [ '%.3g' % np.min(x[:,i,:,:,:]) ]
-        max_str += [ '%.3g' % np.max(x[:,i,:,:,:]) ]
-        mean_str += [ '%.3g' % np.mean(x[:,i,:,:,:]) ]
-    return ', '.join(min_str), ', '.join(max_str), ', '.join(mean_str)
   
+def softmax(x, axis):
+    z = x - tf.reduce_max(x, axis, keepdims=True)
+    y = tf.exp(z) / tf.reduce_sum(tf.exp(z), axis, keepdims=True)
+    return y
+
 class EnvModel():
     
-    def __init__(self, obs_shape, nrof_actions=None, nrof_time_steps=None):
-        length, width, height, depth = obs_shape
+    def __init__(self, obs, actions, nrof_actions=None, nrof_time_steps=None):
+        _, length, width, height, depth = obs.get_shape().as_list()
         nrof_init_time_steps = 3
     
-        self.obs = tf.placeholder(tf.float32, [None, length, width, height, depth])
-        self.actions = tf.placeholder(tf.int32, [None, length])
+        self.obs = obs
+        self.actions = actions
         
         # Encode observations
         obs_reshaped = tf.reshape(self.obs, [-1, width, height, depth])
@@ -239,24 +240,29 @@ class EnvModel():
         self.sigma_hat = tf.stack(sigma_hat_list, axis=1)
         self.z = tf.stack(z_list, axis=1)
         self.next_state = tf.stack(next_state_list, axis=1)
-        self.obs_hat = tf.stack(obs_hat_list, axis=1)
+        self.obs_hat = softmax(tf.stack(obs_hat_list, axis=1), axis=[2,3,4])
 
         # Calculate loss
         self.regularization_loss, self.zz = kl_divergence_gaussians(self.mu, self.sigma, self.mu_hat, self.sigma_hat)
-        self.reconstruction_loss = cross_entropy(self.obs[:,nrof_init_time_steps:,:,:,:], self.obs_hat)  # Should be KL divergence according to paper
+        self.reconstruction_loss = kl_div(self.obs[:,nrof_init_time_steps:,:,:,:], self.obs_hat)
+        
+
         
 def create_dataset(filelist, path, nrof_epochs=1, buffer_size=25, batch_size=10):
     def gen(filelist, path):
         for fn in filelist:
             data = np.float32(load_pickle(os.path.join(path, fn)))
+            data = np.expand_dims(data, 4)
+            data = np.repeat(data, 3, axis=4)
+            #print(data.shape)
             for i in range(data.shape[0]):
-                yield data[i,:13,:,:,:]
+                yield data[i,:13,:,:,:], np.zeros((13,), dtype=np.int32)
           
-    ds = Dataset.from_generator(lambda: gen(filelist, path), tf.float32, tf.TensorShape([13, 80, 80, 3]))
+    ds = Dataset.from_generator(lambda: gen(filelist, path), (tf.float32, tf.int32), (tf.TensorShape([13, 80, 80, 3]), tf.TensorShape([13,])))
     ds = ds.repeat(nrof_epochs)
     ds = ds.prefetch(buffer_size)
     ds = ds.batch(batch_size)
-    return ds    
+    return ds
     
 def load_pickle(filename):
     with open(filename, 'rb') as f:
@@ -268,45 +274,40 @@ if __name__ == '__main__':
     with tf.Session() as sess:
       
         filelist = [ 'bouncing_balls_training_data_%03d.pkl' % i for i in range(20) ]
-        ds = create_dataset(filelist, 'data', nrof_epochs=1, buffer_size=25, batch_size=10)
+        dataset = create_dataset(filelist, 'data', nrof_epochs=10, buffer_size=20000, batch_size=16)
+
+        # Create an iterator over the dataset
+        iterator = dataset.make_one_shot_iterator()
+        obs, action = iterator.get_next()
       
         with tf.variable_scope('env_model'):
-            env_model = EnvModel((13, 80, 80, 3), 1, 10)
+            env_model = EnvModel(obs, action, 1, 10)
 
-        reg_loss = tf.reduce_sum(env_model.regularization_loss)
-        rec_loss = tf.reduce_sum(env_model.reconstruction_loss)
+        reg_loss = tf.reduce_mean(env_model.regularization_loss)
+        rec_loss = tf.reduce_mean(env_model.reconstruction_loss)
         loss = reg_loss + rec_loss
-        train_op = tf.train.AdamOptimizer().minimize(loss)
+
+        global_step = tf.Variable(0, name='global_step', trainable=False)
+        train_op = tf.train.AdamOptimizer().minimize(loss, global_step=global_step)
 
         sess.run(tf.global_variables_initializer())
 
-        train = load_pickle('data/bouncing_balls_testing_data.pkl')
-        train = np.expand_dims(train, 4)
-        train = np.repeat(train, 3, axis=4)
-        obs = train[0:10,:13,:,:,:]
-        actions = np.zeros((10,13), dtype=np.float32)
-        m = env_model
-        
-        print('Training')
-        feed_dict = {env_model.obs:obs, env_model.actions:actions}
-        for batch in range(20):
-            #_, obs_hat_, next_state_, rec_loss_, reg_loss_, loss_ = sess.run([train_op, env_model.obs_hat, env_model.next_state, rec_loss, reg_loss, loss], feed_dict=feed_dict)
-            obs_hat_, initial_state_, next_state_, reg_loss_, rec_loss_, eoi_, mu_, sigma_, mu_hat_, sigma_hat_, zz_, encoded_obs_, z_, _ = sess.run(
-              [m.obs_hat, m.initial_state, m.next_state, m.regularization_loss, m.reconstruction_loss, m.encoded_obs_init, m.mu, m.sigma, m.mu_hat, m.sigma_hat, m.zz, m.encoded_obs, m.z, train_op], feed_dict=feed_dict)
-            
-            print('obs:              (%s), (%s), (%s)' % format_mmm(obs))
-            print('encoded obs:      (%s), (%s), (%s)' % format_mmm(encoded_obs_))
-            print('mu:               (%s), (%s), (%s)' % format_mmm(mu_))
-            print('sigma:            (%s), (%s), (%s)' % format_mmm(sigma_))
-            print('mu_hat:           (%s), (%s), (%s)' % format_mmm(mu_hat_))
-            print('sigma_hat:        (%s), (%s), (%s)' % format_mmm(sigma_hat_))
-            print('z:                (%s), (%s), (%s)' % format_mmm(z_))
-            print('next_state:       (%s), (%s), (%s)' % format_mmm(next_state_))
-            print('obs_hat:          (%s), (%s), (%s)' % format_mmm(obs_hat_))
-            
-            print('Reconstruction loss: ', rec_loss_[0,:])
-            print('Regularization loss: ', reg_loss_[0,:])
-            
-            print('\n\n\n')
-        #print('Total loss: ', loss_)
+        try:
+            print('Started training')
+            rec_loss_tot, reg_loss_tot, loss_tot = (0.0, 0.0, 0.0) 
+            t = time.time()
+            # Keep running next batch until the dataset is exhausted
+            while True:
+                _, rec_loss_, reg_loss_, loss_, step_ = sess.run([train_op, rec_loss, reg_loss, loss, global_step])
+                rec_loss_tot += rec_loss_
+                reg_loss_tot += reg_loss_
+                loss_tot += loss_
+                if (step_+1) % 10 == 0:
+                    print('step: %-5d  rec_loss: %-12.1f reg_loss: %-12.1f loss: %-12.1f' % (step_+1, rec_loss_tot / 10, reg_loss_tot/10, loss_tot/10))
+                    rec_loss_tot, reg_loss_tot, loss_tot = (0.0, 0.0, 0.0) 
+                    t = time.time()
+                
+        except tf.errors.OutOfRangeError:
+            print('Done!')
+
         
