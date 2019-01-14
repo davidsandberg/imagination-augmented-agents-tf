@@ -3,6 +3,7 @@ import numpy as np
 import pickle
 import os
 import time
+import datetime
 from tensorflow.python.data import Dataset
 
 
@@ -142,7 +143,7 @@ def kl_divergence_gaussians(p_mu, p_sigma, q_mu, q_sigma):
     zz = tf.distributions.kl_divergence(
     tf.distributions.Normal(loc=q_mu, scale=q_sigma+eps),
     tf.distributions.Normal(loc=p_mu, scale=p_sigma+eps))
-    return tf.reduce_sum(zz, axis=[2,3,4]), zz
+    return tf.reduce_sum(zz, axis=[2,3,4])
   
 def kl_divergence_gaussians2(p_mu, p_sigma_log, q_mu, q_sigma_log):
     #https://hk.saowen.com/a/7404b78cd5b980e16e08423192e35ec18ecb3cb243d310a9d9a194747d9ee1ba
@@ -151,7 +152,7 @@ def kl_divergence_gaussians2(p_mu, p_sigma_log, q_mu, q_sigma_log):
     p_sigma, q_sigma = tf.exp(p_sigma_log), tf.exp(q_sigma_log)
     #zz = tf.log(p_sigma) - tf.log(q_sigma) - .5 * (1. - (q_sigma**2 + r**2) / (p_sigma**2+eps))
     zz = p_sigma_log - q_sigma_log - .5 * (1. - (q_sigma**2 + r**2) / (p_sigma**2+eps))
-    return tf.reduce_sum(zz, axis=[2,3,4]), zz
+    return tf.reduce_sum(zz, axis=[2,3,4])
 
 def kl_div(p, q):
     eps = 1e-6
@@ -243,7 +244,10 @@ class EnvModel():
         self.obs_hat = softmax(tf.stack(obs_hat_list, axis=1), axis=[2,3,4])
 
         # Calculate loss
-        self.regularization_loss, self.zz = kl_divergence_gaussians(self.mu, self.sigma, self.mu_hat, self.sigma_hat)
+        lmbd = 0.1  # nats per dimension
+        f = lmbd * np.prod(self.mu.get_shape().as_list()[2:])
+        print('Reg loss limit: %.3f' % f)
+        self.regularization_loss = tf.maximum(tf.constant(f, tf.float32), kl_divergence_gaussians(self.mu, self.sigma, self.mu_hat, self.sigma_hat))
         self.reconstruction_loss = kl_div(self.obs[:,nrof_init_time_steps:,:,:,:], self.obs_hat)
         
 
@@ -269,12 +273,18 @@ def load_pickle(filename):
         arr = pickle.load(f)
     return arr
 
+def gettime():
+    return datetime.datetime.strftime(datetime.datetime.now(), '%Y%m%d-%H%M%S')
+
 if __name__ == '__main__':
+  
+    checkpoint_dir = '/home/david/git/imagination-augmented-agents-tf/checkpoints/' + gettime()
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
     with tf.Session() as sess:
       
         filelist = [ 'bouncing_balls_training_data_%03d.pkl' % i for i in range(20) ]
-        dataset = create_dataset(filelist, 'data', nrof_epochs=10, buffer_size=20000, batch_size=16)
+        dataset = create_dataset(filelist, 'data', nrof_epochs=5, buffer_size=20000, batch_size=16)
 
         # Create an iterator over the dataset
         iterator = dataset.make_one_shot_iterator()
@@ -290,11 +300,13 @@ if __name__ == '__main__':
         global_step = tf.Variable(0, name='global_step', trainable=False)
         train_op = tf.train.AdamOptimizer().minimize(loss, global_step=global_step)
 
+        saver = tf.train.Saver()
+
         sess.run(tf.global_variables_initializer())
 
         try:
             print('Started training')
-            rec_loss_tot, reg_loss_tot, loss_tot = (0.0, 0.0, 0.0) 
+            rec_loss_tot, reg_loss_tot, loss_tot = (0.0, 0.0, 0.0)
             t = time.time()
             # Keep running next batch until the dataset is exhausted
             while True:
@@ -302,12 +314,15 @@ if __name__ == '__main__':
                 rec_loss_tot += rec_loss_
                 reg_loss_tot += reg_loss_
                 loss_tot += loss_
-                if (step_+1) % 10 == 0:
-                    print('step: %-5d  rec_loss: %-12.1f reg_loss: %-12.1f loss: %-12.1f' % (step_+1, rec_loss_tot / 10, reg_loss_tot/10, loss_tot/10))
+                if (step_) % 10 == 0:
+                    print('step: %-5d  rec_loss: %-12.1f reg_loss: %-12.1f loss: %-12.1f' % (step_, rec_loss_tot/10, reg_loss_tot/10, loss_tot/10))
                     rec_loss_tot, reg_loss_tot, loss_tot = (0.0, 0.0, 0.0) 
                     t = time.time()
                 
         except tf.errors.OutOfRangeError:
             print('Done!')
 
+        print("Saving model...")
+        saver.save(sess, checkpoint_dir, global_step)
+        
         
