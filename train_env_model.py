@@ -162,7 +162,7 @@ def softmax(x, axis):
   
 class EnvModel():
     
-    def __init__(self, is_inference, obs, actions, nrof_actions=None, nrof_time_steps=None):
+    def __init__(self, is_pdt, obs, actions, nrof_actions=None, nrof_time_steps=None):
         _, length, width, height, depth = obs.get_shape().as_list()
         nrof_init_time_steps = 3
     
@@ -203,15 +203,15 @@ class EnvModel():
             sigma_list += [ sigma ]
             
             # Compute posterior statistics
-            mu_hat_x, sigma_hat_x = posterior_module(mu, sigma, state, self.encoded_obs[:,t,:,:,:], onehot_actions[:,t,:,:,:])
-            mu_hat = tf.cond(is_inference, lambda: mu_hat_x, lambda: tf.zeros(tf.shape(state), dtype=tf.float32))
-            sigma_hat = tf.cond(is_inference, lambda: sigma_hat_x, lambda: tf.zeros(tf.shape(state), dtype=tf.float32))
+            mu_hat, sigma_hat = posterior_module(mu, sigma, state, self.encoded_obs[:,t,:,:,:], onehot_actions[:,t,:,:,:])
             mu_hat_list += [ mu_hat ]
             sigma_hat_list += [ sigma_hat ]
             
             # Sample from z using the reparametrization trick
             eps = tf.random_normal(tf.shape(sigma), 0.0, 1.0, dtype=tf.float32)
-            z = tf.cond(is_inference, lambda: mu_hat+tf.multiply(sigma_hat, eps), lambda: mu+tf.multiply(sigma, eps))
+            mu_x = tf.where(is_pdt[:,t], mu, mu_hat)
+            sigma_x = tf.where(is_pdt[:,t], sigma, sigma_hat)
+            z = mu_x + tf.multiply(sigma_x, eps)
             z_list += [ z ]
             
             # Calculate next state
@@ -235,26 +235,23 @@ class EnvModel():
         self.obs_hat = tf.nn.sigmoid(tf.stack(obs_hat_list, axis=1))
 
         # Calculate loss
-        lmbd = 0.1  # nats per dimension
+        lmbd = 0.05  # nats per dimension
         f = lmbd * np.prod(self.mu.get_shape().as_list()[2:])
         print('Reg loss limit: %.3f' % f)
         self.regularization_loss = tf.maximum(tf.constant(f, tf.float32), kl_divergence_gaussians(self.mu, self.sigma, self.mu_hat, self.sigma_hat))
         self.reconstruction_loss = kl_div_bernoulli(self.obs[:,nrof_init_time_steps:,:,:,:], self.obs_hat)
         
-
-        
-def create_dataset(filelist, path, nrof_epochs=1, buffer_size=25, batch_size=10):
+def create_dataset(filelist, path, buffer_size=25, batch_size=10):
     def gen(filelist, path):
         for fn in filelist:
             data = np.float32(load_pickle(os.path.join(path, fn)))
             data = np.expand_dims(data, 4)
             data = np.repeat(data, 3, axis=4)
-            #print(data.shape)
             for i in range(data.shape[0]):
                 yield data[i,:13,:,:,:], np.zeros((13,), dtype=np.int32)
           
     ds = Dataset.from_generator(lambda: gen(filelist, path), (tf.float32, tf.int32), (tf.TensorShape([13, 80, 80, 3]), tf.TensorShape([13,])))
-    ds = ds.repeat(nrof_epochs)
+    ds = ds.repeat(count=None)
     ds = ds.prefetch(buffer_size)
     ds = ds.batch(batch_size)
     return ds
@@ -263,26 +260,42 @@ def load_pickle(filename):
     with open(filename, 'rb') as f:
         arr = pickle.load(f)
     return arr
+  
+def save_pickle(filename, var_list):
+    with open(filename, 'wb') as f:
+        pickle.dump(var_list, f)
 
 def gettime():
     return datetime.datetime.strftime(datetime.datetime.now(), '%Y%m%d-%H%M%S')
 
 if __name__ == '__main__':
   
-    checkpoint_dir = '/home/david/git/imagination-augmented-agents-tf/checkpoints/' + gettime()
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    res_name = gettime()
+    res_dir = os.path.join('/home/david/git/imagination-augmented-agents-tf/results/', res_name) 
+    os.makedirs(res_dir, exist_ok=True)
+    log_filename = os.path.join(res_dir, 'log.pkl')
+    model_filename = os.path.join(res_dir, res_name)
 
     with tf.Session() as sess:
       
+        batch_size = 16
+        length = 10
+        max_nrof_steps = 10000
+      
         filelist = [ 'bouncing_balls_training_data_%03d.pkl' % i for i in range(20) ]
-        dataset = create_dataset(filelist, 'data', nrof_epochs=15, buffer_size=20000, batch_size=16)
+        dataset = create_dataset(filelist, 'data', buffer_size=20000, batch_size=batch_size)
 
         # Create an iterator over the dataset
         iterator = dataset.make_one_shot_iterator()
         obs, action = iterator.get_next()
+        
+        
+        is_pdt_ph = tf.placeholder(tf.bool, [None, length])
+        is_pdt = np.ones((batch_size, length), np.bool)
+        is_pdt[:,0::4] = False
       
         with tf.variable_scope('env_model'):
-            env_model = EnvModel(tf.constant(True), obs, action, 1, 10)
+            env_model = EnvModel(is_pdt_ph, obs, action, 1, length)
 
         reg_loss = tf.reduce_mean(env_model.regularization_loss)
         rec_loss = tf.reduce_mean(env_model.reconstruction_loss)
@@ -294,26 +307,36 @@ if __name__ == '__main__':
         saver = tf.train.Saver()
 
         sess.run(tf.global_variables_initializer())
+        
+        loss_log = np.zeros((max_nrof_steps,), np.float32)
+        rec_loss_log = np.zeros((max_nrof_steps,), np.float32)
+        reg_loss_log = np.zeros((max_nrof_steps,), np.float32)
 
         try:
             print('Started training')
             rec_loss_tot, reg_loss_tot, loss_tot = (0.0, 0.0, 0.0)
             t = time.time()
             # Keep running next batch until the dataset is exhausted
-            while True:
-                _, rec_loss_, reg_loss_, loss_, step_, obs_hat_ = sess.run([train_op, rec_loss, reg_loss, loss, global_step, env_model.obs_hat])
+            for i in range(max_nrof_steps):
+                _, rec_loss_, reg_loss_, loss_ = sess.run([train_op, rec_loss, reg_loss, loss], feed_dict={is_pdt_ph: is_pdt})
+                loss_log[i], rec_loss_log[i], reg_loss_log[i] = loss_, rec_loss_, reg_loss_
                 rec_loss_tot += rec_loss_
                 reg_loss_tot += reg_loss_
                 loss_tot += loss_
-                if (step_) % 10 == 0:
-                    print('step: %-5d  rec_loss: %-12.1f reg_loss: %-12.1f loss: %-12.1f' % (step_, rec_loss_tot/10, reg_loss_tot/10, loss_tot/10))
+                if i % 10 == 0:
+                    print('step: %-5d  rec_loss: %-12.1f reg_loss: %-12.1f loss: %-12.1f' % (i, rec_loss_tot/10, reg_loss_tot/10, loss_tot/10))
                     rec_loss_tot, reg_loss_tot, loss_tot = (0.0, 0.0, 0.0) 
                     t = time.time()
+                if i % 5000 == 0 and i>0:
+                    saver.save(sess, model_filename, i)
+                if i % 100 == 0 and i>0:
+                    save_pickle(log_filename, [loss_log, rec_loss_log, reg_loss_log])
+
                 
         except tf.errors.OutOfRangeError:
             print('Done!')
 
         print("Saving model...")
-        saver.save(sess, checkpoint_dir, global_step)
+        saver.save(sess, model_filename, i)
         
         
