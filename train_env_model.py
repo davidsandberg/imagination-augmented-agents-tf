@@ -114,20 +114,6 @@ def observation_decoder(s, z):
         dts2 = tf.nn.depth_to_space(cs2, 4)
     return dts2
 
-# def kl_divergence_gaussians(mu0, log_sigma0, mu1, log_sigma1):
-#     '''Implements KL divergence between two Gaussians with diagonal covariance matrices based on
-#     https://en.wikipedia.org/wiki/Kullback%E2%80%93Leibler_divergence
-#     The prior evolves over time and will hence not be restricted to N(0,1)
-#     '''
-#     sigma0 = tf.exp(log_sigma0)
-#     sigma1 = tf.exp(log_sigma1)
-#     k = 0.0
-#     tf1 = tf.reduce_sum(1.0/sigma1 * sigma0, axis=[2,3,4])
-#     tf2 = tf.reduce_sum((mu1-mu0)*1.0/sigma1*(mu1-mu0), axis=[2,3,4])
-#     tf3 = tf.cast(tf.log(tf.reduce_prod(sigma1/sigma0, axis=[2,3,4])), tf.float32)
-#     Dkl = 0.5 * (tf1 + tf2 - k + tf3)
-#     return Dkl
-  
 def kl_div_gauss(action_dist1, action_dist2, action_size):
     # https://github.com/openai/baselines/blob/f2729693253c0ef4d4086231d36e0a4307ec1cb3/baselines/acktr/utils.py
     mean1, std1 = action_dist1[:, :action_size], action_dist1[:, action_size:]
@@ -154,9 +140,12 @@ def kl_divergence_gaussians2(p_mu, p_sigma_log, q_mu, q_sigma_log):
     zz = p_sigma_log - q_sigma_log - .5 * (1. - (q_sigma**2 + r**2) / (p_sigma**2+eps))
     return tf.reduce_sum(zz, axis=[2,3,4])
 
-def kl_div(p, q):
+def kl_div_bernoulli(p, q):
     eps = 1e-6
-    kl = tf.reduce_sum(p * (tf.log(p+eps) - tf.log(q+eps)), axis=[2,3,4])
+    #kl = tf.reduce_sum(p*tf.log((p+eps)/(q+eps)) + (1-p)*tf.log((1-p+eps)/(1-q+eps)+eps), axis=[2,3,4])
+    pc = tf.clip_by_value(p, eps, 1-eps)
+    qc = tf.clip_by_value(q, eps, 1-eps)
+    kl = tf.reduce_sum(pc*tf.log(pc/qc) + (1-pc)*tf.log((1-pc)/(1-qc)), axis=[2,3,4])
     return kl
   
 def get_onehot_actions(actions, nrof_actions, state_shape):
@@ -170,10 +159,10 @@ def softmax(x, axis):
     z = x - tf.reduce_max(x, axis, keepdims=True)
     y = tf.exp(z) / tf.reduce_sum(tf.exp(z), axis, keepdims=True)
     return y
-
+  
 class EnvModel():
     
-    def __init__(self, obs, actions, nrof_actions=None, nrof_time_steps=None):
+    def __init__(self, is_inference, obs, actions, nrof_actions=None, nrof_time_steps=None):
         _, length, width, height, depth = obs.get_shape().as_list()
         nrof_init_time_steps = 3
     
@@ -214,13 +203,15 @@ class EnvModel():
             sigma_list += [ sigma ]
             
             # Compute posterior statistics
-            mu_hat, sigma_hat = posterior_module(mu, sigma, state, self.encoded_obs[:,t,:,:,:], onehot_actions[:,t,:,:,:])
+            mu_hat_x, sigma_hat_x = posterior_module(mu, sigma, state, self.encoded_obs[:,t,:,:,:], onehot_actions[:,t,:,:,:])
+            mu_hat = tf.cond(is_inference, lambda: mu_hat_x, lambda: tf.zeros(tf.shape(state), dtype=tf.float32))
+            sigma_hat = tf.cond(is_inference, lambda: sigma_hat_x, lambda: tf.zeros(tf.shape(state), dtype=tf.float32))
             mu_hat_list += [ mu_hat ]
             sigma_hat_list += [ sigma_hat ]
             
             # Sample from z using the reparametrization trick
-            eps = tf.random_normal(tf.shape(sigma_hat), 0.0, 1.0, dtype=tf.float32)
-            z = mu_hat + tf.multiply(sigma_hat, eps)
+            eps = tf.random_normal(tf.shape(sigma), 0.0, 1.0, dtype=tf.float32)
+            z = tf.cond(is_inference, lambda: mu_hat+tf.multiply(sigma_hat, eps), lambda: mu+tf.multiply(sigma, eps))
             z_list += [ z ]
             
             # Calculate next state
@@ -241,14 +232,14 @@ class EnvModel():
         self.sigma_hat = tf.stack(sigma_hat_list, axis=1)
         self.z = tf.stack(z_list, axis=1)
         self.next_state = tf.stack(next_state_list, axis=1)
-        self.obs_hat = softmax(tf.stack(obs_hat_list, axis=1), axis=[2,3,4])
+        self.obs_hat = tf.nn.sigmoid(tf.stack(obs_hat_list, axis=1))
 
         # Calculate loss
         lmbd = 0.1  # nats per dimension
         f = lmbd * np.prod(self.mu.get_shape().as_list()[2:])
         print('Reg loss limit: %.3f' % f)
         self.regularization_loss = tf.maximum(tf.constant(f, tf.float32), kl_divergence_gaussians(self.mu, self.sigma, self.mu_hat, self.sigma_hat))
-        self.reconstruction_loss = kl_div(self.obs[:,nrof_init_time_steps:,:,:,:], self.obs_hat)
+        self.reconstruction_loss = kl_div_bernoulli(self.obs[:,nrof_init_time_steps:,:,:,:], self.obs_hat)
         
 
         
@@ -284,14 +275,14 @@ if __name__ == '__main__':
     with tf.Session() as sess:
       
         filelist = [ 'bouncing_balls_training_data_%03d.pkl' % i for i in range(20) ]
-        dataset = create_dataset(filelist, 'data', nrof_epochs=5, buffer_size=20000, batch_size=16)
+        dataset = create_dataset(filelist, 'data', nrof_epochs=15, buffer_size=20000, batch_size=16)
 
         # Create an iterator over the dataset
         iterator = dataset.make_one_shot_iterator()
         obs, action = iterator.get_next()
       
         with tf.variable_scope('env_model'):
-            env_model = EnvModel(obs, action, 1, 10)
+            env_model = EnvModel(tf.constant(True), obs, action, 1, 10)
 
         reg_loss = tf.reduce_mean(env_model.regularization_loss)
         rec_loss = tf.reduce_mean(env_model.reconstruction_loss)
@@ -310,7 +301,7 @@ if __name__ == '__main__':
             t = time.time()
             # Keep running next batch until the dataset is exhausted
             while True:
-                _, rec_loss_, reg_loss_, loss_, step_ = sess.run([train_op, rec_loss, reg_loss, loss, global_step])
+                _, rec_loss_, reg_loss_, loss_, step_, obs_hat_ = sess.run([train_op, rec_loss, reg_loss, loss, global_step, env_model.obs_hat])
                 rec_loss_tot += rec_loss_
                 reg_loss_tot += reg_loss_
                 loss_tot += loss_
