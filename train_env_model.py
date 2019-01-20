@@ -316,8 +316,7 @@ if __name__ == '__main__':
             print('Started training')
             rec_loss_tot, reg_loss_tot, loss_tot = (0.0, 0.0, 0.0)
             t = time.time()
-            # Keep running next batch until the dataset is exhausted
-            for i in range(max_nrof_steps):
+            for i in range(max_nrof_steps+1):
                 _, rec_loss_, reg_loss_, loss_ = sess.run([train_op, rec_loss, reg_loss, loss], feed_dict={is_pdt_ph: is_pdt})
                 loss_log[i], rec_loss_log[i], reg_loss_log[i] = loss_, rec_loss_, reg_loss_
                 rec_loss_tot += rec_loss_
@@ -334,9 +333,11 @@ if __name__ == '__main__':
 
                 
         except tf.errors.OutOfRangeError:
-            print('Done!')
-
+            pass
+          
         print("Saving model...")
         saver.save(sess, model_filename, i)
+
+        print('Done!')
         
         
